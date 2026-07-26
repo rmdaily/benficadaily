@@ -61,20 +61,65 @@ function categorizar(titulo){
 
 // --- Descobrir o link REAL do artigo, por trás do redirecionamento do Google ---
 // O Google Notícias não aponta diretamente para o site da notícia: aponta para
-// uma página intermédia dele próprio, que só depois redireciona (com JavaScript)
-// para o artigo verdadeiro. Um pedido normal do servidor não executa esse
-// JavaScript, por isso vamos procurar o link real escondido no HTML dessa página.
+// uma página intermédia dele próprio. O link verdadeiro está escondido (cifrado)
+// dentro do próprio endereço, e só o "sistema interno" do Google Notícias sabe
+// descodificá-lo. Esta função imita esse pedido interno para conseguir o link real.
 
-function extrairLinkReal(html){
-  const padroes = [
-    /data-n-au="([^"]+)"/,           // atributo onde o Google guarda o link real
-    /<a[^>]+class="VDXfz"[^>]+href="([^"]+)"/, // variante antiga da página do Google Notícias
-  ];
-  for(const regex of padroes){
-    const match = html.match(regex);
-    if(match && match[1]) return match[1].replace(/&amp;/g, '&');
+async function descodificarLinkGoogle(googleUrl, htmlDaPagina){
+  try{
+    // 1) tira o "código" do artigo a partir do próprio URL
+    const { pathname } = new URL(googleUrl);
+    const segmentos = pathname.split('/').filter(Boolean);
+    const codigoArtigo = segmentos[segmentos.length - 1];
+    if(!codigoArtigo) return null;
+
+    // 2) tira a "assinatura" e o "carimbo temporal" escondidos no HTML da página
+    const sigMatch = htmlDaPagina.match(/data-n-a-sg="([^"]+)"/);
+    const tsMatch = htmlDaPagina.match(/data-n-a-ts="([^"]+)"/);
+    if(!sigMatch || !tsMatch){
+      console.log('[descodificar] não encontrei data-n-a-sg / data-n-a-ts no HTML');
+      return null;
+    }
+    const assinatura = sigMatch[1];
+    const carimbo = tsMatch[1];
+
+    // 3) pede ao Google para descodificar, usando o mesmo formato que o
+    // próprio site usa internamente (chamada interna "Fbv4je")
+    const pedidoInterno = `["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],"${codigoArtigo}",${carimbo},"${assinatura}"]`;
+    const corpo = 'f.req=' + encodeURIComponent(JSON.stringify([[["Fbv4je", pedidoInterno]]]));
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 7000);
+    const res = await fetch('https://news.google.com/_/DotsSplashUi/data/batchexecute', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      body: corpo,
+    });
+    clearTimeout(timer);
+    if(!res.ok){
+      console.log(`[descodificar] pedido interno falhou com estado ${res.status}`);
+      return null;
+    }
+
+    const texto = await res.text();
+    const partes = texto.split('\n\n');
+    if(partes.length < 2){
+      console.log('[descodificar] resposta em formato inesperado');
+      return null;
+    }
+    const dados = JSON.parse(partes[1]);
+    const linkReal = JSON.parse(dados[0][2])[1];
+    if(typeof linkReal === 'string' && linkReal.startsWith('http')) return linkReal;
+    console.log('[descodificar] link decodificado não parece um URL válido:', linkReal);
+    return null;
+  }catch(err){
+    console.log('[descodificar] erro inesperado:', err.message);
+    return null; // Google pode ter mudado o formato outra vez, ou bloqueou — sem problema
   }
-  return null;
 }
 
 // --- Buscar uma pequena descrição na própria página da notícia ---
@@ -153,8 +198,8 @@ async function resolverArtigo(linkOriginal){
     return { link: primeiraPagina.urlFinal, descricao };
   }
 
-  // ainda estamos numa página do Google: procura o link real escondido no HTML
-  const linkReal = extrairLinkReal(primeiraPagina.html);
+  // ainda estamos numa página do Google: descodifica o link verdadeiro
+  const linkReal = await descodificarLinkGoogle(linkOriginal, primeiraPagina.html);
   if(!linkReal){
     return { link: linkOriginal, descricao: null }; // não conseguimos descobrir, sem problema
   }
