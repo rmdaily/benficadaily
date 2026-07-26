@@ -100,17 +100,25 @@ function extrairDescricao(html){
   return null;
 }
 
-async function buscarHtml(url, timeoutMs = 6000){
+// Vai buscar o HTML de uma página. Se o site fizer um redirecionamento
+// HTTP a sério (não só JavaScript), 'res.url' já vem com o endereço final,
+// o que nos poupa um pedido extra.
+async function buscarPagina(url, timeoutMs = 7000){
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try{
     const res = await fetch(url, {
       signal: controller.signal,
       redirect: 'follow',
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SLBenficaBot/1.0)' },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'pt-PT,pt;q=0.9',
+      },
     });
     if(!res.ok) return null;
-    return await res.text();
+    const html = await res.text();
+    return { html, urlFinal: res.url || url };
   }catch(err){
     return null; // site bloqueou, demorou demasiado, etc. — sem problema
   }finally{
@@ -122,28 +130,43 @@ async function buscarHtml(url, timeoutMs = 6000){
 // descrição a essa página final. Devolve { link, descricao }.
 async function resolverArtigo(linkOriginal){
   const isLinkGoogle = linkOriginal.includes('news.google.com');
-  let linkFinal = linkOriginal;
-  let falhouResolucao = false;
 
-  if(isLinkGoogle){
-    const htmlIntermedio = await buscarHtml(linkOriginal);
-    const linkReal = htmlIntermedio ? extrairLinkReal(htmlIntermedio) : null;
-    if(linkReal){
-      linkFinal = linkReal;
-    }else{
-      falhouResolucao = true; // não vale a pena buscar descrição na própria página do Google
-    }
+  if(!isLinkGoogle){
+    // não é um link do Google: vai só buscar a descrição diretamente
+    const pagina = await buscarPagina(linkOriginal);
+    let descricao = pagina ? extrairDescricao(pagina.html) : null;
+    if(descricao && descricao.length > 220) descricao = descricao.slice(0, 217) + '…';
+    return { link: linkOriginal, descricao };
   }
 
-  const htmlFinal = falhouResolucao ? null : await buscarHtml(linkFinal);
-  let descricao = htmlFinal ? extrairDescricao(htmlFinal) : null;
-  if(descricao && descricao.length > 220) descricao = descricao.slice(0, 217) + '…';
+  // é um link do Google — primeiro pedido: pode já resolver tudo de uma vez
+  // se o Google fizer um redirecionamento a sério (res.url muda sozinho)
+  const primeiraPagina = await buscarPagina(linkOriginal);
+  if(!primeiraPagina){
+    return { link: linkOriginal, descricao: null };
+  }
 
-  return { link: linkFinal, descricao };
+  if(!primeiraPagina.urlFinal.includes('google.com')){
+    // o próprio pedido já nos levou ao site verdadeiro — aproveita logo o HTML
+    let descricao = extrairDescricao(primeiraPagina.html);
+    if(descricao && descricao.length > 220) descricao = descricao.slice(0, 217) + '…';
+    return { link: primeiraPagina.urlFinal, descricao };
+  }
+
+  // ainda estamos numa página do Google: procura o link real escondido no HTML
+  const linkReal = extrairLinkReal(primeiraPagina.html);
+  if(!linkReal){
+    return { link: linkOriginal, descricao: null }; // não conseguimos descobrir, sem problema
+  }
+
+  const segundaPagina = await buscarPagina(linkReal);
+  let descricao = segundaPagina ? extrairDescricao(segundaPagina.html) : null;
+  if(descricao && descricao.length > 220) descricao = descricao.slice(0, 217) + '…';
+  return { link: linkReal, descricao };
 }
 
 // processa uma lista de notícias em pequenos grupos, para não sobrecarregar
-async function preencherDescricoes(lista, tamanhoGrupo = 5){
+async function preencherDescricoes(lista, tamanhoGrupo = 6){
   for(let i = 0; i < lista.length; i += tamanhoGrupo){
     const grupo = lista.slice(i, i + tamanhoGrupo);
     await Promise.all(grupo.map(async (item) => {
@@ -277,10 +300,19 @@ app.post('/api/atualizar', async (req, res) => {
   res.json({ ok: true, novasEncontradas: novas, totalGuardado: lerNoticias().length });
 });
 
+// controla se já há uma correção total a decorrer, e quanto já foi feito
+let correcaoEmCurso = false;
+let progressoCorrecao = { feitas: 0, total: 0 };
+
 // POST /api/corrigir-tudo -> corrige TODAS as notícias antigas de uma vez
 // (categoria + link real + descrição), sem esperar pelos ciclos automáticos.
-// Pode demorar um pouco se houver muitas notícias por corrigir.
+// Responde LOGO (para o pedido nunca esgotar o tempo limite do servidor) e
+// continua o trabalho em segundo plano. Usa GET /api/progresso para ver como vai.
 app.post('/api/corrigir-tudo', async (req, res) => {
+  if(correcaoEmCurso){
+    return res.json({ ok: true, jaEmCurso: true, ...progressoCorrecao });
+  }
+
   let existentes = lerNoticias();
 
   // remove duplicados por título (mantém sempre o mais antigo/primeiro visto)
@@ -298,6 +330,7 @@ app.post('/api/corrigir-tudo', async (req, res) => {
   for(const n of existentes){
     n.categoria = categorizar(n.titulo);
   }
+  guardarNoticias(existentes); // já guarda duplicados removidos + categorias corrigidas, já
 
   const BOILERPLATE_GOOGLE = 'Comprehensive up-to-date news coverage';
   const precisamCorrecao = existentes.filter(n =>
@@ -306,10 +339,37 @@ app.post('/api/corrigir-tudo', async (req, res) => {
     n.link.includes('news.google.com')
   );
 
-  await preencherDescricoes(precisamCorrecao);
-  guardarNoticias(existentes);
+  res.json({
+    ok: true,
+    duplicadosRemovidos,
+    aCorrigirEmSegundoPlano: precisamCorrecao.length,
+    total: existentes.length,
+    dica: 'Consulta GET /api/progresso para ver como vai.',
+  });
 
-  res.json({ ok: true, duplicadosRemovidos, corrigidas: precisamCorrecao.length, total: existentes.length });
+  // a partir daqui já respondemos ao pedido — o resto corre sozinho
+  correcaoEmCurso = true;
+  progressoCorrecao = { feitas: 0, total: precisamCorrecao.length };
+
+  const tamanhoGrupo = 6;
+  for(let i = 0; i < precisamCorrecao.length; i += tamanhoGrupo){
+    const grupo = precisamCorrecao.slice(i, i + tamanhoGrupo);
+    await Promise.all(grupo.map(async (item) => {
+      if(!item.linkOrigem) item.linkOrigem = item.link;
+      const { link, descricao } = await resolverArtigo(item.linkOrigem);
+      item.link = link;
+      item.descricao = descricao;
+    }));
+    progressoCorrecao.feitas += grupo.length;
+    guardarNoticias(existentes); // vai gravando o progresso aos poucos
+  }
+
+  correcaoEmCurso = false;
+  console.log(`Correção total terminada: ${precisamCorrecao.length} notícias processadas.`);
+});
+
+app.get('/api/progresso', (req, res) => {
+  res.json({ emCurso: correcaoEmCurso, ...progressoCorrecao });
 });
 
 app.get('/', (req, res) => {
