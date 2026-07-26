@@ -53,6 +53,7 @@ function guardarNoticias(lista){
 function categorizar(titulo){
   const t = titulo.toLowerCase();
   if(/mercado|transfer|contrat|refor(ç|c)o|passe|empr(é|e)stimo|assina|rescis/.test(t)) return 'mercado';
+  if(/benfica b\b|equipa b\b|sub-23|sub-19|sub-17|sub-15|juniores|juvenis|iniciados|academia|campus/.test(t)) return 'modalidades';
   if(/basquetebol|futsal|feminino|andebol|h(ó|o)quei|patinagem/.test(t)) return 'modalidades';
   if(/rui costa|presidente|assembleia|\bsad\b|institui(ç|c)(ã|a)o|s(ó|o)cios/.test(t)) return 'clube';
   return 'equipa';
@@ -157,6 +158,17 @@ async function preencherDescricoes(lista, tamanhoGrupo = 5){
   return lista;
 }
 
+// normaliza um título para comparação (minúsculas, sem acentos, sem pontuação)
+// para conseguirmos detetar a MESMA notícia repetida por sites diferentes
+function normalizarTitulo(titulo){
+  return titulo
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // remove acentos
+    .replace(/[^\w\s]/g, '') // remove pontuação
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // --- Ir buscar noticias novas e juntar ao historico ---
 
 async function atualizarNoticias(){
@@ -165,6 +177,10 @@ async function atualizarNoticias(){
   // (linkOrigem), porque é sempre esse que o RSS devolve — o "link" pode já
   // ter sido substituído pelo link real do artigo
   const linksExistentes = new Set(existentes.map(n => n.linkOrigem || n.link));
+  // e também por título, porque o Google Notícias costuma mostrar a MESMA
+  // notícia repetida em vários sites (sindicação), com links diferentes
+  // mas o título praticamente igual
+  const titulosExistentes = new Set(existentes.map(n => normalizarTitulo(n.titulo)));
   let novas = [];
 
   for(const rssUrl of FONTES_RSS){
@@ -175,6 +191,8 @@ async function atualizarNoticias(){
         const partes = (item.title || '').split(' - ');
         const fonte = partes.length > 1 ? partes.pop() : (feed.title || 'Desconhecida');
         const titulo = partes.join(' - ');
+        const tituloNormalizado = normalizarTitulo(titulo);
+        if(titulosExistentes.has(tituloNormalizado)) continue; // já temos esta notícia de outro site
         novas.push({
           titulo,
           link: item.link,
@@ -185,10 +203,25 @@ async function atualizarNoticias(){
           guardadoEm: new Date().toISOString(),
         });
         linksExistentes.add(item.link);
+        titulosExistentes.add(tituloNormalizado);
       }
     }catch(err){
       console.error(`Erro ao ler o feed ${rssUrl}:`, err.message);
     }
+  }
+
+  // recategoriza TODAS as notícias já guardadas com as regras mais recentes
+  // (não custa nada, é só comparar texto, não precisa de aceder à internet)
+  let categoriasCorrigidas = 0;
+  for(const n of existentes){
+    const categoriaCerta = categorizar(n.titulo);
+    if(n.categoria !== categoriaCerta){
+      n.categoria = categoriaCerta;
+      categoriasCorrigidas++;
+    }
+  }
+  if(categoriasCorrigidas > 0){
+    console.log(`Categoria corrigida em ${categoriasCorrigidas} notícia(s).`);
   }
 
   if(novas.length > 0){
@@ -205,14 +238,14 @@ async function atualizarNoticias(){
     !n.descricao ||
     n.descricao.includes(BOILERPLATE_GOOGLE) ||
     n.link.includes('news.google.com')
-  ).slice(0, 15);
+  ).slice(0, 40);
 
   if(precisamCorrecao.length > 0){
     console.log(`A corrigir link/descrição em ${precisamCorrecao.length} notícia(s) antiga(s)…`);
     await preencherDescricoes(precisamCorrecao);
   }
 
-  if(novas.length > 0 || precisamCorrecao.length > 0){
+  if(novas.length > 0 || precisamCorrecao.length > 0 || categoriasCorrigidas > 0){
     const combinadas = [...novas, ...existentes]
       .sort((a, b) => new Date(b.publicadoEm) - new Date(a.publicadoEm))
       .slice(0, MAX_NOTICIAS);
@@ -242,6 +275,41 @@ app.get('/api/noticias', (req, res) => {
 app.post('/api/atualizar', async (req, res) => {
   const novas = await atualizarNoticias();
   res.json({ ok: true, novasEncontradas: novas, totalGuardado: lerNoticias().length });
+});
+
+// POST /api/corrigir-tudo -> corrige TODAS as notícias antigas de uma vez
+// (categoria + link real + descrição), sem esperar pelos ciclos automáticos.
+// Pode demorar um pouco se houver muitas notícias por corrigir.
+app.post('/api/corrigir-tudo', async (req, res) => {
+  let existentes = lerNoticias();
+
+  // remove duplicados por título (mantém sempre o mais antigo/primeiro visto)
+  const titulosVistos = new Set();
+  const semDuplicados = [];
+  for(const n of existentes){
+    const chave = normalizarTitulo(n.titulo);
+    if(titulosVistos.has(chave)) continue;
+    titulosVistos.add(chave);
+    semDuplicados.push(n);
+  }
+  const duplicadosRemovidos = existentes.length - semDuplicados.length;
+  existentes = semDuplicados;
+
+  for(const n of existentes){
+    n.categoria = categorizar(n.titulo);
+  }
+
+  const BOILERPLATE_GOOGLE = 'Comprehensive up-to-date news coverage';
+  const precisamCorrecao = existentes.filter(n =>
+    !n.descricao ||
+    n.descricao.includes(BOILERPLATE_GOOGLE) ||
+    n.link.includes('news.google.com')
+  );
+
+  await preencherDescricoes(precisamCorrecao);
+  guardarNoticias(existentes);
+
+  res.json({ ok: true, duplicadosRemovidos, corrigidas: precisamCorrecao.length, total: existentes.length });
 });
 
 app.get('/', (req, res) => {
