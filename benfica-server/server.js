@@ -128,21 +128,20 @@ async function descodificarLinkGoogle(googleUrl, htmlDaPagina){
 // biblioteca extra de scraping.
 
 function extrairDescricao(html){
-  const padroes = [
-    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i,
-    /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i,
-  ];
-  for(const regex of padroes){
-    const match = html.match(regex);
-    if(match && match[1]){
-      return match[1]
-        .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-        .replace(/&nbsp;/g, ' ').trim();
-    }
-  }
-  return null;
+  // primeiro encontra a tag <meta ...> completa (name="description" ou og:description)
+  const regexTag = /<meta\s+[^>]*(?:name=["']description["']|property=["']og:description["'])[^>]*>/i;
+  const tagMatch = html.match(regexTag);
+  if(!tagMatch) return null;
+
+  // só depois tira o valor do "content", usando o MESMO tipo de aspas com que
+  // começou — assim, aspas normais dentro do texto (ex: uma citação) já não
+  // fazem parar a leitura a meio da frase
+  const contentMatch = tagMatch[0].match(/content=(["'])([\s\S]*?)\1/i);
+  if(!contentMatch || !contentMatch[2]) return null;
+
+  return contentMatch[2]
+    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ').trim();
 }
 
 // Vai buscar o HTML de uma página. Se o site fizer um redirecionamento
@@ -378,11 +377,14 @@ app.post('/api/corrigir-tudo', async (req, res) => {
   guardarNoticias(existentes); // já guarda duplicados removidos + categorias corrigidas, já
 
   const BOILERPLATE_GOOGLE = 'Comprehensive up-to-date news coverage';
-  const precisamCorrecao = existentes.filter(n =>
-    !n.descricao ||
-    n.descricao.includes(BOILERPLATE_GOOGLE) ||
-    n.link.includes('news.google.com')
-  );
+  const forcarTudo = req.query.forcar === 'true';
+  const precisamCorrecao = forcarTudo
+    ? existentes // reprocessa TODAS, mesmo as que já têm descrição (útil depois de melhorar a extração)
+    : existentes.filter(n =>
+        !n.descricao ||
+        n.descricao.includes(BOILERPLATE_GOOGLE) ||
+        n.link.includes('news.google.com')
+      );
 
   res.json({
     ok: true,
