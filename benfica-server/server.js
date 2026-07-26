@@ -58,6 +58,24 @@ function categorizar(titulo){
   return 'equipa';
 }
 
+// --- Descobrir o link REAL do artigo, por trás do redirecionamento do Google ---
+// O Google Notícias não aponta diretamente para o site da notícia: aponta para
+// uma página intermédia dele próprio, que só depois redireciona (com JavaScript)
+// para o artigo verdadeiro. Um pedido normal do servidor não executa esse
+// JavaScript, por isso vamos procurar o link real escondido no HTML dessa página.
+
+function extrairLinkReal(html){
+  const padroes = [
+    /data-n-au="([^"]+)"/,           // atributo onde o Google guarda o link real
+    /<a[^>]+class="VDXfz"[^>]+href="([^"]+)"/, // variante antiga da página do Google Notícias
+  ];
+  for(const regex of padroes){
+    const match = html.match(regex);
+    if(match && match[1]) return match[1].replace(/&amp;/g, '&');
+  }
+  return null;
+}
+
 // --- Buscar uma pequena descrição na própria página da notícia ---
 // Vai buscar o HTML da página e tira a "meta description" (o resumo que
 // os sites já escrevem para aparecer no Google), sem precisar de nenhuma
@@ -81,24 +99,46 @@ function extrairDescricao(html){
   return null;
 }
 
-async function buscarDescricao(url, timeoutMs = 6000){
+async function buscarHtml(url, timeoutMs = 6000){
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try{
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const res = await fetch(url, {
       signal: controller.signal,
       redirect: 'follow',
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SLBenficaBot/1.0)' },
     });
-    clearTimeout(timer);
     if(!res.ok) return null;
-    const html = await res.text();
-    const descricao = extrairDescricao(html);
-    if(!descricao) return null;
-    return descricao.length > 220 ? descricao.slice(0, 217) + '…' : descricao;
+    return await res.text();
   }catch(err){
-    return null; // site bloqueou, demorou demasiado, ou não tem meta description — sem problema
+    return null; // site bloqueou, demorou demasiado, etc. — sem problema
+  }finally{
+    clearTimeout(timer);
   }
+}
+
+// Resolve o link real (se for um link do Google Notícias) e vai buscar a
+// descrição a essa página final. Devolve { link, descricao }.
+async function resolverArtigo(linkOriginal){
+  const isLinkGoogle = linkOriginal.includes('news.google.com');
+  let linkFinal = linkOriginal;
+  let falhouResolucao = false;
+
+  if(isLinkGoogle){
+    const htmlIntermedio = await buscarHtml(linkOriginal);
+    const linkReal = htmlIntermedio ? extrairLinkReal(htmlIntermedio) : null;
+    if(linkReal){
+      linkFinal = linkReal;
+    }else{
+      falhouResolucao = true; // não vale a pena buscar descrição na própria página do Google
+    }
+  }
+
+  const htmlFinal = falhouResolucao ? null : await buscarHtml(linkFinal);
+  let descricao = htmlFinal ? extrairDescricao(htmlFinal) : null;
+  if(descricao && descricao.length > 220) descricao = descricao.slice(0, 217) + '…';
+
+  return { link: linkFinal, descricao };
 }
 
 // processa uma lista de notícias em pequenos grupos, para não sobrecarregar
@@ -106,7 +146,12 @@ async function preencherDescricoes(lista, tamanhoGrupo = 5){
   for(let i = 0; i < lista.length; i += tamanhoGrupo){
     const grupo = lista.slice(i, i + tamanhoGrupo);
     await Promise.all(grupo.map(async (item) => {
-      item.descricao = await buscarDescricao(item.link);
+      // guarda o link original do Google antes de o substituir, para o
+      // reconhecimento de duplicados continuar a funcionar no futuro
+      if(!item.linkOrigem) item.linkOrigem = item.link;
+      const { link, descricao } = await resolverArtigo(item.linkOrigem);
+      item.link = link;
+      item.descricao = descricao;
     }));
   }
   return lista;
@@ -116,7 +161,10 @@ async function preencherDescricoes(lista, tamanhoGrupo = 5){
 
 async function atualizarNoticias(){
   const existentes = lerNoticias();
-  const linksExistentes = new Set(existentes.map(n => n.link));
+  // o reconhecimento de duplicados usa sempre o link original do Google
+  // (linkOrigem), porque é sempre esse que o RSS devolve — o "link" pode já
+  // ter sido substituído pelo link real do artigo
+  const linksExistentes = new Set(existentes.map(n => n.linkOrigem || n.link));
   let novas = [];
 
   for(const rssUrl of FONTES_RSS){
@@ -130,6 +178,7 @@ async function atualizarNoticias(){
         novas.push({
           titulo,
           link: item.link,
+          linkOrigem: item.link,
           fonte,
           categoria: categorizar(titulo),
           publicadoEm: item.pubDate || new Date().toISOString(),
@@ -147,15 +196,23 @@ async function atualizarNoticias(){
     await preencherDescricoes(novas);
   }
 
-  // além das novas, aproveita para preencher a descrição de notícias antigas
-  // que ainda não a têm (feito aos poucos, para não sobrecarregar o servidor)
-  const semDescricao = existentes.filter(n => !n.descricao).slice(0, 15);
-  if(semDescricao.length > 0){
-    console.log(`A preencher descrições em falta em ${semDescricao.length} notícia(s) antiga(s)…`);
-    await preencherDescricoes(semDescricao);
+  // além das novas, aproveita para corrigir notícias antigas que:
+  // - ainda não têm descrição, OU
+  // - ficaram com o texto genérico do Google (versão antiga com bug), OU
+  // - ainda apontam para o link intermédio do Google em vez do artigo real
+  const BOILERPLATE_GOOGLE = 'Comprehensive up-to-date news coverage';
+  const precisamCorrecao = existentes.filter(n =>
+    !n.descricao ||
+    n.descricao.includes(BOILERPLATE_GOOGLE) ||
+    n.link.includes('news.google.com')
+  ).slice(0, 15);
+
+  if(precisamCorrecao.length > 0){
+    console.log(`A corrigir link/descrição em ${precisamCorrecao.length} notícia(s) antiga(s)…`);
+    await preencherDescricoes(precisamCorrecao);
   }
 
-  if(novas.length > 0 || semDescricao.length > 0){
+  if(novas.length > 0 || precisamCorrecao.length > 0){
     const combinadas = [...novas, ...existentes]
       .sort((a, b) => new Date(b.publicadoEm) - new Date(a.publicadoEm))
       .slice(0, MAX_NOTICIAS);
