@@ -1,0 +1,15 @@
+{
+  "name": "benfica-noticias-server",
+  "version": "1.0.0",
+  "description": "Servidor que agrega noticias sobre o Benfica de varias fontes e guarda um historico persistente.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "rss-parser": "^3.13.0"
+  }
+}
