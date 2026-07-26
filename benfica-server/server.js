@@ -58,6 +58,60 @@ function categorizar(titulo){
   return 'equipa';
 }
 
+// --- Buscar uma pequena descrição na própria página da notícia ---
+// Vai buscar o HTML da página e tira a "meta description" (o resumo que
+// os sites já escrevem para aparecer no Google), sem precisar de nenhuma
+// biblioteca extra de scraping.
+
+function extrairDescricao(html){
+  const padroes = [
+    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i,
+    /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i,
+  ];
+  for(const regex of padroes){
+    const match = html.match(regex);
+    if(match && match[1]){
+      return match[1]
+        .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+        .replace(/&nbsp;/g, ' ').trim();
+    }
+  }
+  return null;
+}
+
+async function buscarDescricao(url, timeoutMs = 6000){
+  try{
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(url, {
+      signal: controller.signal,
+      redirect: 'follow',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SLBenficaBot/1.0)' },
+    });
+    clearTimeout(timer);
+    if(!res.ok) return null;
+    const html = await res.text();
+    const descricao = extrairDescricao(html);
+    if(!descricao) return null;
+    return descricao.length > 220 ? descricao.slice(0, 217) + '…' : descricao;
+  }catch(err){
+    return null; // site bloqueou, demorou demasiado, ou não tem meta description — sem problema
+  }
+}
+
+// processa uma lista de notícias em pequenos grupos, para não sobrecarregar
+async function preencherDescricoes(lista, tamanhoGrupo = 5){
+  for(let i = 0; i < lista.length; i += tamanhoGrupo){
+    const grupo = lista.slice(i, i + tamanhoGrupo);
+    await Promise.all(grupo.map(async (item) => {
+      item.descricao = await buscarDescricao(item.link);
+    }));
+  }
+  return lista;
+}
+
 // --- Ir buscar noticias novas e juntar ao historico ---
 
 async function atualizarNoticias(){
@@ -89,6 +143,19 @@ async function atualizarNoticias(){
   }
 
   if(novas.length > 0){
+    console.log(`A procurar descrições para ${novas.length} notícia(s) nova(s)…`);
+    await preencherDescricoes(novas);
+  }
+
+  // além das novas, aproveita para preencher a descrição de notícias antigas
+  // que ainda não a têm (feito aos poucos, para não sobrecarregar o servidor)
+  const semDescricao = existentes.filter(n => !n.descricao).slice(0, 15);
+  if(semDescricao.length > 0){
+    console.log(`A preencher descrições em falta em ${semDescricao.length} notícia(s) antiga(s)…`);
+    await preencherDescricoes(semDescricao);
+  }
+
+  if(novas.length > 0 || semDescricao.length > 0){
     const combinadas = [...novas, ...existentes]
       .sort((a, b) => new Date(b.publicadoEm) - new Date(a.publicadoEm))
       .slice(0, MAX_NOTICIAS);
