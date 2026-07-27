@@ -55,7 +55,7 @@ function categorizar(titulo){
   if(/mercado|transfer|contrat|refor(ç|c)o|passe|empr(é|e)stimo|assina|rescis/.test(t)) return 'mercado';
   if(/benfica b\b|equipa b\b|sub-23|sub-19|sub-17|sub-15|juniores|juvenis|iniciados|academia|campus/.test(t)) return 'modalidades';
   if(/basquetebol|futsal|feminino|andebol|h(ó|o)quei|patinagem/.test(t)) return 'modalidades';
-  if(/rui costa|presidente|assembleia|\bsad\b|institui(ç|c)(ã|a)o|s(ó|o)cios/.test(t)) return 'clube';
+  if(/rui costa|presidente|assembleia|\bsad\b|institui(ç|c)(ã|a)o|s(ó|o)cios|casa(s)? do benfica|caminhada|adepto|associado(s)?|clube de campo/.test(t)) return 'clube';
   return 'equipa';
 }
 
