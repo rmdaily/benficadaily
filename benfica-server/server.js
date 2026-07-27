@@ -50,12 +50,16 @@ function guardarNoticias(lista){
 
 // --- Categorização automática, baseada em palavras-chave no título ---
 
-function categorizar(titulo){
-  const t = titulo.toLowerCase();
-  if(/mercado|transfer|contrat|refor(ç|c)o|passe|empr(é|e)stimo|assina|rescis/.test(t)) return 'mercado';
+function categorizar(titulo, descricao){
+  const t = `${titulo || ''} ${descricao || ''}`.toLowerCase();
+  if(/mercado|transfer|contrat|refor(ç|c)o|passe|empr(é|e)stimo|assina|rescis|renova(ç|c)(ã|a)o|renovar|proposta/.test(t)) return 'mercado';
   if(/benfica b\b|equipa b\b|sub-23|sub-19|sub-17|sub-15|juniores|juvenis|iniciados|academia|campus/.test(t)) return 'modalidades';
   if(/basquetebol|futsal|feminino|andebol|h(ó|o)quei|patinagem/.test(t)) return 'modalidades';
-  if(/rui costa|presidente|assembleia|\bsad\b|institui(ç|c)(ã|a)o|s(ó|o)cios|casa(s)? do benfica|caminhada|adepto|associado(s)?|clube de campo/.test(t)) return 'clube';
+  // nota: "Rui Costa" e "presidente" NÃO entram aqui sozinhos, porque aparecem
+  // com frequência em notícias sobre jogadores/mercado (ex: o presidente a
+  // comentar uma transferência) — só conta como "Clube" quando é mesmo sobre
+  // temas institucionais/de associados
+  if(/assembleia|\bsad\b|institui(ç|c)(ã|a)o|s(ó|o)cios|casa(s)? do benfica|caminhada|adepto|associado(s)?|clube de campo|elei(ç|c)(õ|o)es|or(ç|c)amento/.test(t)) return 'clube';
   return 'equipa';
 }
 
@@ -220,6 +224,7 @@ async function preencherDescricoes(lista, tamanhoGrupo = 6){
       const { link, descricao } = await resolverArtigo(item.linkOrigem);
       item.link = link;
       item.descricao = descricao;
+      item.categoria = categorizar(item.titulo, item.descricao);
     }));
   }
   return lista;
@@ -281,7 +286,7 @@ async function atualizarNoticias(){
   // (não custa nada, é só comparar texto, não precisa de aceder à internet)
   let categoriasCorrigidas = 0;
   for(const n of existentes){
-    const categoriaCerta = categorizar(n.titulo);
+    const categoriaCerta = categorizar(n.titulo, n.descricao);
     if(n.categoria !== categoriaCerta){
       n.categoria = categoriaCerta;
       categoriasCorrigidas++;
@@ -372,7 +377,7 @@ app.post('/api/corrigir-tudo', async (req, res) => {
   existentes = semDuplicados;
 
   for(const n of existentes){
-    n.categoria = categorizar(n.titulo);
+    n.categoria = categorizar(n.titulo, n.descricao);
   }
   guardarNoticias(existentes); // já guarda duplicados removidos + categorias corrigidas, já
 
@@ -406,6 +411,7 @@ app.post('/api/corrigir-tudo', async (req, res) => {
       const { link, descricao } = await resolverArtigo(item.linkOrigem);
       item.link = link;
       item.descricao = descricao;
+      item.categoria = categorizar(item.titulo, item.descricao);
     }));
     progressoCorrecao.feitas += grupo.length;
     guardarNoticias(existentes); // vai gravando o progresso aos poucos
