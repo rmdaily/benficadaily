@@ -425,16 +425,105 @@ app.get('/api/progresso', (req, res) => {
   res.json({ emCurso: correcaoEmCurso, ...progressoCorrecao });
 });
 
+// GET /api/efemerides -> devolve todas as efemérides guardadas (ficheiro
+// editável em data/efemerides.json, sem precisar de mexer no resto do código)
+const EFEMERIDES_FILE = path.join(__dirname, 'data', 'efemerides.json');
+app.get('/api/efemerides', (req, res) => {
+  try{
+    const conteudo = fs.readFileSync(EFEMERIDES_FILE, 'utf-8');
+    res.json(JSON.parse(conteudo));
+  }catch(err){
+    console.error('Erro ao ler efemerides.json:', err.message);
+    res.json({});
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('Servidor de notícias do Benfica está a correr. Usa /api/noticias para consultar.');
+});
+
+// ======================================================================
+// ÚLTIMO E PRÓXIMO JOGO — via TheSportsDB (API gratuita, sem necessidade
+// de conta nem chave própria; usa a chave de teste pública "123").
+// ======================================================================
+
+const SPORTSDB_KEY = '123';
+const SPORTSDB_BASE = `https://www.thesportsdb.com/api/v1/json/${SPORTSDB_KEY}`;
+const BENFICA_TEAM_ID = '134108'; // confirmado em thesportsdb.com/team/134108-benfica
+const JOGOS_FILE = path.join(__dirname, 'data', 'jogos.json');
+
+function lerJogos(){
+  try{
+    return JSON.parse(fs.readFileSync(JOGOS_FILE, 'utf-8'));
+  }catch(e){
+    return { ultimoJogo: null, proximoJogo: null, atualizadoEm: null };
+  }
+}
+
+function guardarJogos(dados){
+  const pasta = path.dirname(JOGOS_FILE);
+  if(!fs.existsSync(pasta)) fs.mkdirSync(pasta, { recursive: true });
+  fs.writeFileSync(JOGOS_FILE, JSON.stringify(dados, null, 2));
+}
+
+// transforma o formato "estranho" da TheSportsDB num formato simples e
+// consistente, para a página não ter de saber nada sobre a API por trás
+function normalizarEvento(evento){
+  if(!evento) return null;
+  const casa = evento.strHomeTeam;
+  const fora = evento.strAwayTeam;
+  const benficaEmCasa = casa && casa.toLowerCase().includes('benfica');
+  return {
+    equipaCasa: casa,
+    equipaFora: fora,
+    benficaEmCasa: !!benficaEmCasa,
+    golosCasa: evento.intHomeScore !== null ? Number(evento.intHomeScore) : null,
+    golosFora: evento.intAwayScore !== null ? Number(evento.intAwayScore) : null,
+    competicao: evento.strLeague || '',
+    ronda: evento.strRound || '',
+    data: evento.dateEvent || null,
+    hora: evento.strTime ? evento.strTime.slice(0, 5) : null,
+    estadio: evento.strVenue || null,
+  };
+}
+
+async function atualizarJogos(){
+  try{
+    const [resNext, resLast] = await Promise.all([
+      fetch(`${SPORTSDB_BASE}/eventsnext.php?id=${BENFICA_TEAM_ID}`),
+      fetch(`${SPORTSDB_BASE}/eventslast.php?id=${BENFICA_TEAM_ID}`),
+    ]);
+
+    const dataNext = resNext.ok ? await resNext.json() : null;
+    const dataLast = resLast.ok ? await resLast.json() : null;
+
+    const proximoJogo = normalizarEvento(dataNext?.events?.[0] || null);
+    const ultimoJogo = normalizarEvento(dataLast?.results?.[0] || dataLast?.events?.[0] || null);
+
+    guardarJogos({ ultimoJogo, proximoJogo, atualizadoEm: new Date().toISOString() });
+    console.log(`[${new Date().toLocaleString('pt-PT')}] Jogos atualizados (TheSportsDB).`);
+  }catch(err){
+    console.error('Erro ao atualizar jogos:', err.message);
+  }
+}
+
+app.get('/api/jogos', (req, res) => {
+  res.json(lerJogos());
+});
+
+app.post('/api/atualizar-jogos', async (req, res) => {
+  await atualizarJogos();
+  res.json({ ok: true, ...lerJogos() });
 });
 
 // --- Agendamento: corre a cada 30 minutos, sozinho, mesmo sem ninguém a visitar a página ---
 cron.schedule('*/30 * * * *', () => {
   atualizarNoticias();
+  atualizarJogos();
 });
 
 app.listen(PORT, () => {
   console.log(`Servidor a correr em http://localhost:${PORT}`);
   atualizarNoticias(); // corre logo uma vez ao arrancar
+  atualizarJogos();
 });
